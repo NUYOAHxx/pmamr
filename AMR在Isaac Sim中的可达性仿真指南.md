@@ -472,16 +472,35 @@ def main():
     ros_node = rclpy.create_node("isaac_collision_monitor")
     col_pub = ros_node.create_publisher(String, "/amr/collision_event", 10)
 
+    import time
+
+    was_in_contact = False
+    last_publish_time = 0.0
+    COLLISION_COOLDOWN_SEC = 0.5  # 防抖冷却，避免接触面高频抖动重复计数
+
     print("[INFO] 仿真已启动，开始监听 3D 包络碰撞...")
     while simulation_app.is_running():
         world.step(render=True)
-        if world.is_playing():
-            reading = contact_sensor.get_current_frame()
-            if reading and reading.get("in_contact", False):
-                force = reading.get("force", 0.0)
+        if not world.is_playing():
+            was_in_contact = False
+            continue
+
+        reading = contact_sensor.get_current_frame()
+        in_contact = bool(reading and reading.get("in_contact", False))
+
+        # 仅在上升沿（未接触 -> 接触）且超过冷却时间时上报一次
+        if in_contact and not was_in_contact:
+            now = time.monotonic()
+            if now - last_publish_time >= COLLISION_COOLDOWN_SEC:
+                raw_force = reading.get("force", 0.0)
+                # force 可能是标量 / 三维向量 / NumPy 数组，统一取模后转 float
+                force_mag = float(np.linalg.norm(np.asarray(raw_force, dtype=float)))
                 msg = String()
-                msg.data = f"COLLISION_DETECTED|force={force:.2f}"
+                msg.data = f"COLLISION_DETECTED|force={force_mag:.2f}"
                 col_pub.publish(msg)
+                last_publish_time = now
+
+        was_in_contact = in_contact
 
     ros_node.destroy_node()
     rclpy.shutdown()
