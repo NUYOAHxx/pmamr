@@ -596,7 +596,8 @@ global_costmap:
       update_frequency: 1.0
       resolution: 0.05
       footprint: "[[0.475, 0.325], [0.475, -0.325], [-0.475, -0.325], [-0.475, 0.325]]"
-      plugins: ["static_layer", "keepout_filter", "inflation_layer"]
+      plugins: ["static_layer", "inflation_layer"]
+      filters: ["keepout_filter"]          # 修正：Costmap Filter 必须放在 filters，不能放 plugins
       static_layer:
         plugin: "nav2_costmap_2d::StaticLayer"
         map_subscribe_transient_local: true
@@ -634,6 +635,8 @@ collision_monitor:
       enabled: true
 ```
 
+> 注：启用 `keepout_filter` 时，launch 中还需配套启动 `costmap_filter_info_server`，并用 `filter_mask_server` 加载禁行遮罩图，否则 `/costmap_filter_info` 无数据、过滤器不生效。
+
 ## 四、 核心程序 3：自动化可达性压测与报表脚本
 
 **文件：`ros2_scripts/run_reachability_benchmark.py`**
@@ -642,6 +645,7 @@ collision_monitor:
 
 ```
 import csv
+import os
 import time
 import math
 from datetime import datetime
@@ -691,6 +695,7 @@ def main():
     navigator.waitUntilNav2Active()
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    os.makedirs("reports", exist_ok=True)
     report_file = f"reports/fab_reachability_{timestamp}.csv"
     results = []
 
@@ -860,7 +865,7 @@ def analyze_fab_aisles():
     for y, x in zip(ys, xs):
         width_m = width_map_m[y, x]
         if MIN_VALID_WIDTH_M <= width_m <= MAX_AISLE_WIDTH_M:
-            valid_points.append((width_m, x, y))
+            valid_points.append((float(width_m), int(x), int(y)))
 
     if not valid_points:
         print("[WARN] 未检测到符合宽度范围的通道，请检查地图阈值或 MIN/MAX_WIDTH 参数。")
