@@ -1,0 +1,139 @@
+planner_server:
+  ros__parameters:
+    expected_planner_frequency: 5.0
+    planner_plugins: ["GridBased"]
+    GridBased:
+      plugin: "nav2_smac_planner::SmacPlannerHybrid"
+      downsample_costmap: false
+      allow_unknown: false
+      max_iterations: 1000000
+      max_planning_time: 5.0
+      # 核心：REEDS_SHEPP 支持前进与倒车（实现窄道直进直退与 K-turn 揉库）
+      motion_model_for_search: "REEDS_SHEPP"
+      angle_quantization_bins: 72           # 每 5 度一个朝向采样，窄道更精准
+      minimum_turning_radius: 0.25          # 差速底盘可设小值（如 0.2~0.3m）避免原地死转
+      reverse_penalty: 1.5                  # 略微惩罚倒车：能正走优先正走，转不过去则果断倒车
+      change_penalty: 0.2                   # 换向惩罚，防止频繁前后抽搐
+      non_straight_penalty: 1.2             # 鼓励在窄道走直线
+      cost_penalty: 2.5                     # 强推离机台边缘，尽量走通道中线
+      footprint_padding: 0.02
+
+controller_server:
+  ros__parameters:
+    controller_frequency: 20.0
+    controller_plugins: ["FollowPath"]
+    FollowPath:
+      plugin: "nav2_mppi_controller::MPPIController"
+      time_steps: 56
+      model_dt: 0.05
+      batch_size: 2000
+      vx_std: 0.2
+      wz_std: 0.4
+      vx_max: 0.8                           # 窄道限速
+      vx_min: -0.35                         # 允许倒车退出窄道
+      wz_max: 0.8
+      # 防震动力学约束（保护晶圆/载具）
+      ax_max: 0.4
+      ax_min: -0.6
+      az_max: 0.8
+      motion_model: "DiffDrive"             # 若换 O3dyn 全向底盘，改为 "Omni"
+      critics: ["ConstraintCritic", "CostCritic", "GoalCritic", "GoalAngleCritic", "PathAlignCritic", "PathFollowCritic", "PreferForwardCritic"]
+      CostCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 4.0
+        critical_cost: 300.0
+        consider_footprint: true            # 核心：严格按矩形车身检测碰撞，而非圆心
+        collision_cost: 1000000.0
+      PreferForwardCritic:
+        enabled: true
+        cost_weight: 3.0                    # 权重不宜过大，否则窄道不愿倒车
+
+local_costmap:
+  local_costmap:
+    ros__parameters:
+      update_frequency: 10.0
+      publish_frequency: 5.0
+      global_frame: odom
+      robot_base_frame: base_link
+      rolling_window: true
+      width: 6
+      height: 6
+      resolution: 0.03                      # 3cm 高分辨率，适配窄通道
+      # 精确矩形 Footprint（长 0.95m x 宽 0.65m，中心为原点）
+      footprint: "[[0.475, 0.325], [0.475, -0.325], [-0.475, -0.325], [-0.475, 0.325]]"
+      # 实验组 A（纯 2D）：去掉 nvblox_layer；实验组 B（3D 视觉）：保留 nvblox_layer
+      plugins: ["obstacle_layer", "nvblox_layer", "inflation_layer"]
+      obstacle_layer:
+        plugin: "nav2_costmap_2d::ObstacleLayer"
+        enabled: true
+        observation_sources: scan
+        scan:
+          topic: /scan
+          max_obstacle_height: 2.0
+          clearing: true
+          marking: true
+          data_type: "LaserScan"
+      nvblox_layer:
+        plugin: "nvblox::nav2::NvbloxCostmapLayer"
+        enabled: true
+        nav2_costmap_global_frame: odom
+        nvblox_map_slice_topic: "/nvblox_node/static_map_slice"
+        convert_to_binary_costmap: true
+      inflation_layer:
+        plugin: "nav2_costmap_2d::InflationLayer"
+        cost_scaling_factor: 5.0
+        inflation_radius: 0.25              # 窄道膨胀半径不宜过大，否则通道会被封死
+
+global_costmap:
+  global_costmap:
+    ros__parameters:
+      update_frequency: 1.0
+      resolution: 0.05
+      footprint: "[[0.475, 0.325], [0.475, -0.325], [-0.475, -0.325], [-0.475, 0.325]]"
+      plugins: ["static_layer", "inflation_layer"]
+      # 首轮跑通先注释掉：没有 filter_mask_server + costmap_filter_info_server 时 Nav2 会一直等话题
+      # filters: ["keepout_filter"]        # 修正：Costmap Filter 必须放在 filters，不能放 plugins
+      static_layer:
+        plugin: "nav2_costmap_2d::StaticLayer"
+        map_subscribe_transient_local: true
+      keepout_filter:
+        plugin: "nav2_costmap_2d::KeepoutFilter"
+        enabled: true
+        filter_info_topic: "/costmap_filter_info"
+      inflation_layer:
+        plugin: "nav2_costmap_2d::InflationLayer"
+        cost_scaling_factor: 4.0
+        inflation_radius: 0.25
+
+collision_monitor:
+  ros__parameters:
+    base_frame_id: "base_link"
+    odom_frame_id: "odom"
+    cmd_vel_in_topic: "cmd_vel_smoothed"
+    cmd_vel_out_topic: "cmd_vel"
+    observation_sources: ["scan"]
+    polygons: ["PolygonStop", "PolygonSlow"]
+    PolygonStop:
+      type: "polygon"
+      # 比车身四周大 10cm 的硬件级急停区
+      points: "[[0.575, 0.425], [0.575, -0.425], [-0.575, -0.425], [-0.575, 0.425]]"
+      action_type: "stop"
+      min_points: 3
+      enabled: true
+    PolygonSlow:
+      type: "polygon"
+      # 前后延伸 1.0m 的减速预警区
+      points: "[[1.475, 0.50], [1.475, -0.50], [-1.475, -0.50], [-1.475, 0.50]]"
+      action_type: "slowdown"
+      slowdown_ratio: 0.4
+      min_points: 3
+      enabled: true
+
+# ------------------------------------------------------------
+# 禁用 Spin / BackUp：必须指向自定义行为树 config/fab_narrow_no_spin.xml
+# 只改 planner/controller 参数无效，车卡死时默认 BT 仍会原地旋转扫机台
+# ------------------------------------------------------------
+bt_navigator:
+  ros__parameters:
+    default_nav_to_pose_bt_xml: "<绝对路径>/config/fab_narrow_no_spin.xml"

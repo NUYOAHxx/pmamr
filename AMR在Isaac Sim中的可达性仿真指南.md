@@ -335,12 +335,16 @@ $$
 fab_amr_validation/
 ├── config/
 │   ├── nav2_fab_narrow_params.yaml   # Nav2 核心配置 (Hybrid A* + MPPI + Nvblox + Collision Monitor)
-│   └── test_waypoints.yaml           # 场景关键测试点位（含目标朝向 Yaw）
+│   └── fab_narrow_no_spin.xml        # 无 Spin/BackUp 的脱困行为树（窄道严禁原地旋转）
 ├── isaac_scripts/
-│   └── setup_fab_scene.py            # Isaac Sim 5.1 场景碰撞体加载 + 参数化矩形车身 + 碰撞监控
+│   └── setup_fab_scene.py            # 场景碰撞体加载 + 参数化矩形车身 + 碰撞监控
 ├── ros2_scripts/
 │   └── run_reachability_benchmark.py # 自动化发点、监听碰撞、导出 CSV 报告
-└── reports/                          # 自动生成的测试结果报表
+├── analysis/
+│   └── analyze_fab_aisles.py         # 占据栅格图通道净宽与最窄瓶颈分析
+├── scripts/                          # 1~4 步启动脚本（仿真 / Nav2 / 压测 / 分析）
+├── reports/                          # 自动生成的测试结果报表
+└── requirements.txt                  # 分析脚本依赖（opencv-python、scikit-image 等）
 ```
 
 ### 核心测试矩阵设计（控制变量法）
