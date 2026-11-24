@@ -362,7 +362,8 @@ fab_amr_validation/
 
 1. 自动遍历你的 FAB USD 场景，跳过地板，为所有机台/墙壁批量绑定精确的 `Triangle Mesh` 静态碰撞体，并铺设平整物理地面防止卡轮。
 2. 加载内置 `Nova Carter` 作为驱动底座，在其上挂载一个**可动态修改长宽高的矩形包络代理盒**与 **Contact Sensor（接触传感器）**。
-3. 实时监测物理碰撞，一旦代理盒擦碰机台，立即通过 ROS 2 话题 `/amr/collision_event` 发出报警。
+3. 实时监测物理碰撞，一旦代理盒擦碰机台，立即通过 ROS 2 话题 `/amr/collision_event` 发出报警（上升沿触发 + 0.5s 防抖，一次擦碰只报一次）。
+4. 订阅 `/amr/reset_pose`，支持把车体瞬移回安全起点并清零速度，供自动化压测在用例之间复位。
 
 ```
 import sys
@@ -378,12 +379,15 @@ from pxr import Usd, UsdGeom, UsdPhysics, PhysxSchema, Gf
 from isaacsim.core.api import World
 from isaacsim.core.utils.stage import add_reference_to_stage
 from isaacsim.core.utils.extensions import enable_extension
+from isaacsim.core.utils.nucleus import get_assets_root_path
+from isaacsim.core.prims import Articulation
 from isaacsim.sensors.physics import ContactSensor
 
 # 启用 ROS 2 Bridge 扩展
 enable_extension("isaacsim.ros2.bridge")
 import rclpy
 from std_msgs.msg import String
+from geometry_msgs.msg import PoseStamped
 
 # ================= 参数配置区（压测时只需改这里） =================
 FAB_USD_PATH = "/path/to/your/fab_scene.usd"   # 替换为你的 FAB USD 路径
@@ -393,6 +397,8 @@ FLOOR_KEYWORDS = ["floor", "ground", "tile"]   # 地板名称关键词（跳过�
 # 参数化矩形车身包络尺寸（米）：[长 L, 宽 W, 高 H]
 PROXY_BOX_SIZE = [0.95, 0.65, 1.40]
 PROXY_Z_OFFSET = PROXY_BOX_SIZE[2] / 2.0 + 0.05  # 离地间隙 5cm
+PROXY_RENDER_VISIBLE = False                   # False：代理盒不参与渲染，不遮挡 LiDAR/相机射线
+RESET_POSE_Z = 0.05                            # 外部复位时车体的离地高度
 # =================================================================
 
 def batch_add_static_colliders(stage, root_path):
@@ -416,11 +422,19 @@ def batch_add_static_colliders(stage, root_path):
             count += 1
     print(f"[INFO] 已为 {count} 个静态机台/墙壁网格批量加载碰撞体。")
 
-def attach_parameterized_proxy_box(stage, robot_base_path, size_lwh, z_offset):
-    """在底盘上挂载可调尺寸的矩形包络代理盒，用于检测 3D 扫掠碰撞"""
+def attach_parameterized_proxy_box(stage, robot_base_path, size_lwh, z_offset, visible=False):
+    """在底盘上挂载可调尺寸的矩形包络代理盒，用于检测 3D 扫掠碰撞
+
+    注意：盒子放大到整车尺寸后会把车身上的 2D LiDAR / 深度相机整体包住，
+    RTX 射线打在盒内壁上会导致雷达与相机全盲（有墙却直冲）。因此默认 MakeInvisible()：
+    传感器不对不可见几何做射线求交，而物理碰撞仍然正常触发。
+    需要肉眼确认包络形状时，把 PROXY_RENDER_VISIBLE 设为 True 即可。
+    """
     proxy_path = f"{robot_base_path}/Envelope_Proxy_Box"
     cube = UsdGeom.Cube.Define(stage, proxy_path)
     cube.CreateSizeAttr(1.0)
+    if not visible:
+        UsdGeom.Imageable(cube).MakeInvisible()
 
     # 设置长宽高缩放与离地高度
     xform = UsdGeom.Xformable(cube)
@@ -448,14 +462,22 @@ def main():
     batch_add_static_colliders(stage, SCENE_ROOT_PRIM)
 
     # 3. 导入内置 Nova Carter（自带 ROS 2 里程计、2D LiDAR、3D 深度相机）
-    # 注意：实际路径可通过 Isaac Sim Nucleus Assets 获取
-    carter_usd = "omniverse://localhost/NVIDIA/Assets/Isaac/5.1/Isaac/Robots/NovaCarter/nova_carter.usd"
+    # 用 get_assets_root_path() 动态拼接路径，避免写死 localhost 后换机器/换版本找不到资产
+    assets_root = get_assets_root_path()
+    if assets_root is None:
+        carb.log_error("未找到 Nucleus 资产根目录，请检查 Nucleus 连接或本地资产包")
+        simulation_app.close()
+        return
+    carter_usd = f"{assets_root}/Isaac/Robots/NovaCarter/nova_carter.usd"
     robot_prim_path = "/World/Nova_Carter"
     add_reference_to_stage(usd_path=carter_usd, prim_path=robot_prim_path)
+    # 包一层 Articulation，便于外部复位时直接 set_world_pose / 清零速度
+    carter = world.scene.add(Articulation(prim_paths_expr=robot_prim_path, name="carter"))
 
     # 4. 挂载参数化矩形包络盒 + 接触传感器
     proxy_path = attach_parameterized_proxy_box(
-        stage, f"{robot_prim_path}/chassis_link", PROXY_BOX_SIZE, PROXY_Z_OFFSET
+        stage, f"{robot_prim_path}/chassis_link", PROXY_BOX_SIZE, PROXY_Z_OFFSET,
+        visible=PROXY_RENDER_VISIBLE
     )
     contact_sensor = ContactSensor(
         prim_path=f"{proxy_path}/contact_sensor",
@@ -472,6 +494,18 @@ def main():
     ros_node = rclpy.create_node("isaac_collision_monitor")
     col_pub = ros_node.create_publisher(String, "/amr/collision_event", 10)
 
+    def on_reset_pose(msg):
+        """外部复位：车体瞬移回安全起点并清零速度，避免上一条用例的卡死位姿污染下一条"""
+        pos = np.array([msg.pose.position.x, msg.pose.position.y, RESET_POSE_Z], dtype=np.float64)
+        quat = np.array([msg.pose.orientation.w, msg.pose.orientation.x,
+                         msg.pose.orientation.y, msg.pose.orientation.z], dtype=np.float64)
+        carter.set_world_pose(position=pos, orientation=quat)
+        carter.set_linear_velocity(np.zeros(3))
+        carter.set_angular_velocity(np.zeros(3))
+        print(f"[INFO] 车体已复位至 ({pos[0]:.2f}, {pos[1]:.2f})")
+
+    ros_node.create_subscription(PoseStamped, "/amr/reset_pose", on_reset_pose, 10)
+
     import time
 
     was_in_contact = False
@@ -481,6 +515,7 @@ def main():
     print("[INFO] 仿真已启动，开始监听 3D 包络碰撞...")
     while simulation_app.is_running():
         world.step(render=True)
+        rclpy.spin_once(ros_node, timeout_sec=0.0)   # 必须 spin，否则 /amr/reset_pose 收不到
         if not world.is_playing():
             was_in_contact = False
             continue
@@ -616,7 +651,8 @@ global_costmap:
       resolution: 0.05
       footprint: "[[0.475, 0.325], [0.475, -0.325], [-0.475, -0.325], [-0.475, 0.325]]"
       plugins: ["static_layer", "inflation_layer"]
-      filters: ["keepout_filter"]          # 修正：Costmap Filter 必须放在 filters，不能放 plugins
+      # 首轮跑通先注释掉：没有 filter_mask_server + costmap_filter_info_server 时 Nav2 会一直等话题
+      # filters: ["keepout_filter"]        # 修正：Costmap Filter 必须放在 filters，不能放 plugins
       static_layer:
         plugin: "nav2_costmap_2d::StaticLayer"
         map_subscribe_transient_local: true
@@ -660,7 +696,7 @@ collision_monitor:
 
 **文件：`ros2_scripts/run_reachability_benchmark.py`**
 
-**功能**：自动读取预设的 FAB 机台目标点，依次控制 AMR 导航过去，后台实时监听 Isaac Sim 发来的 `/amr/collision_event`，自动判定每条路线的状态（`SUCCESS` / `COLLISION_FAIL` / `PLAN_OR_TIMEOUT_FAIL`），并生成 CSV 报告。
+**功能**：自动读取预设的 FAB 机台目标点，依次控制 AMR 导航过去，后台实时监听 Isaac Sim 发来的 `/amr/collision_event`，自动判定每条路线的状态（`SUCCESS` / `COLLISION_FAIL` / `PLAN_OR_TIMEOUT_FAIL`），并生成 CSV 报告。每条用例开始前会先通过 `/amr/reset_pose` 把车体复位到安全起点并清空代价地图，保证用例之间互不污染。
 
 ```
 import csv
@@ -674,6 +710,10 @@ from std_msgs.msg import String
 from geometry_msgs.msg import PoseStamped
 from nav2_simple_commander.robot_navigator import BasicNavigator, TaskResult
 
+# 每条用例开始前把车体复位到的安全起点（x, y, yaw_deg）
+START_POSE = (0.0, 0.0, 180.0)
+RESET_SETTLE_SEC = 2.0
+
 # 测试点位定义：[名称, x, y, yaw_deg]（实际使用时可从 YAML 读取）
 FAB_TEST_GOALS = [
     ("Bay1_Narrow_Aisle_Entry", 4.5, 0.0, 0.0),
@@ -686,6 +726,7 @@ class CollisionListener(Node):
     def __init__(self):
         super().__init__('benchmark_collision_listener')
         self.sub = self.create_subscription(String, '/amr/collision_event', self._cb, 10)
+        self.reset_pub = self.create_publisher(PoseStamped, '/amr/reset_pose', 10)
         self.collision_count = 0
 
     def _cb(self, msg):
@@ -693,6 +734,19 @@ class CollisionListener(Node):
 
     def reset(self):
         self.collision_count = 0
+
+    def teleport_robot(self, x, y, yaw_deg, settle_sec=2.0):
+        """把车体瞬移回安全起点（Isaac 侧订阅 /amr/reset_pose 执行），避免卡死位姿污染下一条用例"""
+        msg = PoseStamped()
+        msg.header.frame_id = 'map'
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.pose.position.x = float(x)
+        msg.pose.position.y = float(y)
+        yaw_rad = math.radians(yaw_deg)
+        msg.pose.orientation.z = math.sin(yaw_rad / 2.0)
+        msg.pose.orientation.w = math.cos(yaw_rad / 2.0)
+        self.reset_pub.publish(msg)
+        time.sleep(settle_sec)   # 等物理状态、TF 与代价地图稳定后再下发下一个目标
 
 def create_pose(navigator, x, y, yaw_deg):
     pose = PoseStamped()
@@ -721,6 +775,9 @@ def main():
     for name, x, y, yaw in FAB_TEST_GOALS:
         print(f"\n>>> 开始测试目标点: {name} (x={x}, y={y}, yaw={yaw}°)")
         col_listener.reset()
+        # 每条用例前后互相独立：先瞬移回安全起点，再清空残留障碍，避免上一条撞车卡死后污染后续数据
+        col_listener.teleport_robot(*START_POSE, settle_sec=RESET_SETTLE_SEC)
+        navigator.clearAllCostmaps()
         goal_pose = create_pose(navigator, x, y, yaw)
 
         start_time = time.time()
@@ -965,3 +1022,69 @@ python3 analyze_fab_aisles.py
     - **洋红色圆圈**：最窄瓶颈处的**最大内切圆**，圆圈的直径就是该处卡住车身的物理极限。
 
 ---
+
+## 附：首轮跑通必改的 4 个隐坑与推进节奏
+
+> 正文按「能长期跑」写；下面 4 条是「第一次就想不报错、不出现隐形失效」必须闭环的点，上文对应代码已按此修正。
+
+### 1. 代理盒可能把雷达和深度相机「包」起来（最大隐藏坑）
+
+- **现象**：代理盒挂在 `chassis_link` 上并带 `CollisionAPI`，尺寸放大到整车包络后，Nova Carter 的 2D LiDAR 与深度相机被整体包在盒内。RTX 射线打在盒内壁上 → 雷达与相机全盲，表现为「明明有墙却直冲」。
+- **方案 A（默认采用，改动最小）**：代理盒只承担物理碰撞，不参与渲染。`PROXY_RENDER_VISIBLE = False` 时对盒子执行 `UsdGeom.Imageable.MakeInvisible()`；RTX 传感器不对不可见几何做射线求交，而 PhysX 接触仍然正常触发。调参阶段设回 `True` 即可肉眼确认包络形状。
+- **方案 B（最真实）**：把 LiDAR / 相机 Prim 动态移到盒外表面（车头前脸、车顶前缘），代价是传感器外参要随车身尺寸一起改。
+- **如需更细**：再叠加 `UsdPhysics.FilteredPairsAPI` 或 PhysX Collision Group，让代理盒「只与机台接触、不与地面/自车其他部件接触」。第一轮不必上。
+
+### 2. Nav2 的两处「隐形依赖」
+
+- **禁用 Spin 必须换行为树**：只改 YAML 不生效。`bt_navigator` 默认加载 `navigate_to_pose_w_replanning_and_recovery.xml`，`Spin` / `BackUp` 仍在里面，车卡住时照样原地转圈扫机台。需要自定义 BT 并指定 `default_nav_to_pose_bt_xml`：
+
+```xml
+<!-- config/fab_narrow_no_spin.xml：只保留「重规划 + 清理代价地图」，彻底去掉 Spin / BackUp / Wait -->
+<root main_tree_to_execute="MainTree">
+  <BehaviorTree ID="MainTree">
+    <PipelineSequence name="NavigateWithReplanning">
+      <RateController hz="1.0">
+        <RecoveryNode number_of_retries="3" name="ComputePathToPose">
+          <ComputePathToPose goal="{goal}" path="{path}" planner_id="GridBased"/>
+          <ClearEntireCostmap name="ClearGlobalCostmap" service_name="global_costmap/clear_entirely_global_costmap"/>
+        </RecoveryNode>
+      </RateController>
+      <RecoveryNode number_of_retries="1" name="FollowPath">
+        <FollowPath path="{path}" controller_id="FollowPath"/>
+        <ClearEntireCostmap name="ClearLocalCostmap" service_name="local_costmap/clear_entirely_local_costmap"/>
+      </RecoveryNode>
+    </PipelineSequence>
+  </BehaviorTree>
+</root>
+```
+
+```yaml
+bt_navigator:
+  ros__parameters:
+    default_nav_to_pose_bt_xml: "<绝对路径>/config/fab_narrow_no_spin.xml"
+```
+
+- **KeepoutFilter 需要配套节点**：`filter_mask_server`（加载遮罩图）+ `costmap_filter_info_server`（发布 `/costmap_filter_info`）。所以首轮先把 `filters: ["keepout_filter"]` 注释掉（上文 YAML 已按此处理），等车能正常动了再开禁行区。
+
+### 3. 定位先用「仿真真值」，别一上来就 AMCL
+
+- FAB 内长直走廊多、机台外形高度相似，AMCL 容易漂。第一轮把定位误差混进来，撞了也分不清是「定位飘了」还是「通道太窄」。
+- 做法：本阶段直接在 Isaac 的 Action Graph 里发布真值 TF（`map -> odom -> base_link`，`map -> odom` 用静态单位变换），**不启动 AMCL**。等纯粹的几何与规划边界结论拿到后，再叠加 AMCL 做鲁棒性回归——这样每条失败都能唯一归因到几何或规划。
+
+### 4. 资产路径 + 失败后的「状态重置」
+
+- **资产路径**：不要写死 `omniverse://localhost/...`，改用 `get_assets_root_path()` 拼接（上文脚本已改），换机器/换版本都不会 `FileNotFoundError`。
+- **卡死污染**：第 2 个点撞车卡死后，第 3 个点会从卡死位姿出发，后续结果全废。因此每条用例开始前通过 `/amr/reset_pose` 把车体瞬移回安全起点、清零速度，再 `clearAllCostmaps()` 清掉残留障碍，然后才下发新目标（上文两个脚本已打通：Isaac 侧订阅复位，压测侧发点）。
+
+> 说明：Isaac 侧复位用的是 `Articulation.set_world_pose()`，属于纯仿真手段，不经过规划器；若希望更接近真实部署，可改为调用 Nav2 的 `initialpose` 重定位流程，但第一轮无需引入这层复杂度。
+
+### 推荐推进节奏（每步都能单独验收）
+
+| 阶段 | 做什么 | 验收标准 |
+| --- | --- | --- |
+| **第 0 步（今天就能跑）** | 用修好的 `analyze_fab_aisles.py` 跑一遍你的 `fab_map.pgm` | 10 分钟内拿到全图最窄净宽 + Top-N 瓶颈的 ROS 坐标，先把「车能做多大」摸清 |
+| **第 1 步（最小闭环）** | 真值 TF + 纯 2D LiDAR + `SmacPlannerHybrid` + MPPI；先不开 `keepout_filter`、不开 Nvblox | Nova Carter 在场景里连续走完 3~5 个点，`Collision_Count = 0` |
+| **第 2 步（叠加压测）** | 挂修正后的代理盒、开 Nvblox、换无 Spin 行为树，跑 Exp_01~04 | 拿到「尺寸 × 感知模式」对比 CSV，输出选型边界结论 |
+
+---
+
