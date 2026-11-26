@@ -15,14 +15,16 @@ Isaac Sim 5.1 + ROS 2 Jazzy + Nav2 环境下的窄通道 AMR 可达性验证工�
 ├── isaac_scripts/
 │   └── setup_fab_scene.py            # 场景碰撞体加载 + 参数化包络代理盒 + 碰撞监控
 ├── ros2_scripts/
-│   └── run_reachability_benchmark.py # 自动发点、监听碰撞、导出 CSV 报表
+│   ├── run_reachability_benchmark.py # 自动发点、监听碰撞、导出 CSV 报表
+│   └── publish_swept_area.py         # 把质心轨迹扩成车身扫掠带（看车扫过的体积）
 ├── analysis/
 │   └── analyze_fab_aisles.py         # 占据栅格图通道净宽 / 最窄瓶颈分析
 ├── scripts/
 │   ├── 1_start_sim.sh                # 启动仿真场景
 │   ├── 2_start_nav2.sh               # 启动 Nav2（含地图与参数）
 │   ├── 3_run_benchmark.sh            # 运行压测
-│   └── 4_run_analysis.sh             # 运行净宽分析
+│   ├── 4_run_analysis.sh             # 运行净宽分析
+│   └── 5_show_swept_area.sh          # 显示车身扫掠带 / 扫掠体
 ├── reports/                          # 自动生成的 CSV 报表
 └── requirements.txt                  # 分析脚本依赖
 ```
@@ -44,7 +46,21 @@ bash scripts/3_run_benchmark.sh
 
 # 4. 分析最窄通道（先改 analyze_fab_aisles.py 顶部的 YAML_PATH）
 bash scripts/4_run_analysis.sh
+
+# 5. 看车身扫掠带（RViz Add -> MarkerArray，topic: /swept_area）
+bash scripts/5_show_swept_area.sh
 ```
+
+## 车身扫掠带
+
+Nav2 发布的 `/plan`、`/trajectory` 都是 `base_link` 原点的单条线，不含宽度。
+`publish_swept_area.py` 把每个位姿的矩形包络（0.95 × 0.65 × 1.4 m）投影出来：
+
+- 白色质心线 + 青/橙左右边缘线 + 半透明黄色填充带（俯视面积）
+- `--mode 3d` 时再加蓝色半透明立方体序列，形成立体隧道
+- 终端同时打印：路径长度、扫掠带面积（位姿凸包并集）、直线距离、绕行比
+
+拐角处扫掠带一旦压到机台轮廓，说明几何上真的过不去，与控制器调参无关。
 
 ## 关键前提
 

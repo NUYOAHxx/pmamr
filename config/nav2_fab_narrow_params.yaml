@@ -16,7 +16,7 @@ planner_server:
       change_penalty: 0.2                   # 换向惩罚，防止频繁前后抽搐
       non_straight_penalty: 1.2             # 鼓励在窄道走直线
       cost_penalty: 2.5                     # 强推离机台边缘，尽量走通道中线
-      footprint_padding: 0.02
+      footprint_padding: 0.0               # 零余量：不做额外外扩，碰撞判定只看真实 footprint
 
 controller_server:
   ros__parameters:
@@ -84,6 +84,11 @@ local_costmap:
         plugin: "nav2_costmap_2d::InflationLayer"
         cost_scaling_factor: 5.0
         inflation_radius: 0.25              # 窄道膨胀半径不宜过大，否则通道会被封死
+        # ---- 零余量档（A/B 对比用，把上面两行换成下面这组）----
+        # 半径 = 车体内切圆半径 (W/2 = 0.325)，之外代价迅速归零，安全边界≈0
+        # 代价图仍保留 253/254 语义，MPPI 的 CostCritic 碰撞判定不失效（比彻底删层稳定）
+        # cost_scaling_factor: 10.0
+        # inflation_radius: 0.325
 
 global_costmap:
   global_costmap:
@@ -105,6 +110,9 @@ global_costmap:
         plugin: "nav2_costmap_2d::InflationLayer"
         cost_scaling_factor: 4.0
         inflation_radius: 0.25
+        # ---- 零余量档（A/B 对比用）----
+        # cost_scaling_factor: 10.0
+        # inflation_radius: 0.325
 
 collision_monitor:
   ros__parameters:
@@ -116,14 +124,15 @@ collision_monitor:
     polygons: ["PolygonStop", "PolygonSlow"]
     PolygonStop:
       type: "polygon"
-      # 比车身四周大 10cm 的硬件级急停区
-      points: "[[0.575, 0.425], [0.575, -0.425], [-0.575, -0.425], [-0.575, 0.425]]"
+      # 零余量档：直接等于车身 footprint（0.95 × 0.65），压到即停，不留外扩
+      # 想回到"车身 + 10cm 安全边界"的保守档：[[0.575, 0.425], [0.575, -0.425], [-0.575, -0.425], [-0.575, 0.425]]
+      points: "[[0.475, 0.325], [0.475, -0.325], [-0.475, -0.325], [-0.475, 0.325]]"
       action_type: "stop"
       min_points: 3
       enabled: true
     PolygonSlow:
       type: "polygon"
-      # 前后延伸 1.0m 的减速预警区
+      # 前后延伸 1.0m 的减速预警区（只是降速带，不构成碰撞余量，故保留横向 0.50）
       points: "[[1.475, 0.50], [1.475, -0.50], [-1.475, -0.50], [-1.475, 0.50]]"
       action_type: "slowdown"
       slowdown_ratio: 0.4
